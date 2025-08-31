@@ -18,7 +18,7 @@ LOGAC is an automated security testing framework for web applications focused on
 
 1. Clone this repository:
 ```bash
-git clone https://github.com/yourusername/logac.git
+git clone https://github.com/Andiansyah23/logac.git
 cd logac
 ```
 
