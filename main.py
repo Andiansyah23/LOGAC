@@ -4,42 +4,8 @@ import os
 import json
 from crawler import WebCrawler
 from auth_tester import AuthTester
+from bruteforce import DirectoryBruteforcer
 from urllib.parse import urljoin
-async def directory_bruteforce(host, wordlist_path, dir_output, filter_auth=False):
-    # Mock implementation - in real, use requests to check 200 for each word as path
-    valid_urls = []
-    words = []
-    with open(wordlist_path, 'r') as f:
-        words = [line.strip() for line in f if line.strip()]
-   
-    if filter_auth:
-        login_keywords = ['login', 'auth', 'signin', 'signup', 'log-in', 'log_in', 'authentication', 'masuk', 'akun', 'sign-in', 'session']
-        words = [w for w in words if any(k in w.lower() for k in login_keywords)]
-   
-    async with aiohttp.ClientSession() as session:
-        tasks = []
-        for word in words:
-            url = urljoin(host, word)
-            tasks.append(session.get(url, allow_redirects=False))
-       
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
-       
-        for i, resp in enumerate(responses):
-            if not isinstance(resp, Exception) and resp.status == 200:
-                valid_urls.append(urljoin(host, words[i]))
-   
-    # Save without dupe
-    existing = set()
-    if os.path.exists(dir_output):
-        with open(dir_output, 'r') as f:
-            existing = {line.strip() for line in f}
-   
-    with open(dir_output, 'a') as f:
-        for url in valid_urls:
-            if url not in existing:
-                f.write(url + '\n')
-   
-    return valid_urls
 def generate_report(safe_host, directories, successful_logins, brute_success, otp_brute_success, manual_used):
     html = """
 <html>
@@ -135,6 +101,7 @@ async def handle_otp(tester, crawler, account, auto_mode=False):
         else:
             print(f"[-] OTP failed")
             return False, None
+        
 async def main():
     host = input("Enter target host (e.g., http://example.com): ").strip()
     output_dir = "data"
@@ -146,16 +113,48 @@ async def main():
     safe_host = host.replace('http://', '').replace('https://', '').replace(':', '_').replace('/', '_').rstrip('/')
     dir_output = f"data/dir_{safe_host}.txt"
     successful_logins_path = f"data/successful_logins_{safe_host}.txt"
-   
     wordlist_path = "data/wordlist.txt"
-    if not os.path.exists(wordlist_path):
-        print(f"[-] Wordlist not found at {wordlist_path}")
-        return
-   
-    # Step 1: Brute directory with login filter
-    print("[*] Brute forcing login directories...")
-    await directory_bruteforce(host, wordlist_path, dir_output, filter_auth=True)
-   
+        
+    # Create bruteforcer instance AFTER wordlist_path is defined
+    bruteforcer = DirectoryBruteforcer(host, wordlist_path, dir_output)
+    
+    # Check if result file already exists
+    if os.path.exists(dir_output):
+        with open(dir_output, 'r') as f:
+            valid_urls = [line.strip() for line in f if line.strip()]
+        print(f"[+] File {dir_output} already exists, found {len(valid_urls)} URLs. Skipping brute force.")
+    else:
+        # Ask user for scan mode
+        print("[?] Select scan mode:")
+        print("1. Full (entire wordlist)")
+        print("2. Login page only (authentication section only)")
+        choice = input("Choice (1/2): ").strip()
+        
+        if choice == "2":
+            # Filter wordlist for authentication section only
+            filtered_words = await bruteforcer.filter_wordlist_login_only()
+            
+            if not filtered_words:
+                print("[-] No words found in authentication section, using full mode")
+                valid_urls = await bruteforcer.run(filter_auth=False)
+            else:
+                # Create temporary wordlist file for authentication only
+                temp_wordlist_path = f"data/wordlist_auth_{safe_host}.tmp"
+                with open(temp_wordlist_path, 'w') as f:
+                    for word in filtered_words:
+                        f.write(word + '\n')
+                
+                # Create a new bruteforcer instance for the filtered wordlist
+                auth_bruteforcer = DirectoryBruteforcer(host, temp_wordlist_path, dir_output)
+                print(f"[*] Using authentication-only wordlist: {len(filtered_words)} words")
+                valid_urls = await auth_bruteforcer.run(filter_auth=False)
+                
+                # Remove temporary file
+                os.remove(temp_wordlist_path)
+        else:
+            # Full mode
+            valid_urls = await bruteforcer.run(filter_auth=False)
+                                                              
     # Step 2: Search for login page from dir list
     crawler = WebCrawler(host)
     login_page, login_form = await crawler.find_login_page(dir_output)
