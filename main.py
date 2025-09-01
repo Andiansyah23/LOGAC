@@ -6,6 +6,7 @@ from crawler import WebCrawler
 from auth_tester import AuthTester
 from bruteforce import DirectoryBruteforcer
 from urllib.parse import urljoin
+
 def generate_report(safe_host, directories, successful_logins, brute_success, otp_brute_success, manual_used):
     html = """
 <html>
@@ -40,68 +41,7 @@ def generate_report(safe_host, directories, successful_logins, brute_success, ot
     with open(f"data/report_{safe_host}.html", 'w') as f:
         f.write(html)
     print(f"[+] Report saved to data/report_{safe_host}.html")
-async def handle_otp(tester, crawler, account, auto_mode=False):
-    print(f"[*] Processing OTP for {account['username']}")
-   
-    otp_form = None
-    if tester.last_response:
-        otp_form = await crawler.crawl_otp_form(tester.last_response.url)
-   
-    if not otp_form:
-        otp_paths = ['/sessions/two-factor', '/otp', '/2fa', '/twofactor', '/verify']
-        for path in otp_paths:
-            test_url = urljoin(tester.base_url, path)
-            print(f"[*] Checking OTP form at: {test_url}")
-            otp_form = await crawler.crawl_otp_form(test_url)
-            if otp_form:
-                break
-   
-    if not otp_form:
-        print(f"[-] OTP form not found for {account['username']}")
-        return False
-   
-    print("[+] OTP form found")
-    print(f" URL: {otp_form['action']}")
-    print(f" Method: {otp_form['method']}")
-    print(" Inputs:")
-    for inp in otp_form.get('inputs', []):
-        print(f" {inp.get('name', 'N/A')} ({inp.get('type', 'N/A')}) = {inp.get('value', '')}")
-   
-    # Detect length and type
-    length, otp_type = tester.detect_otp_details(tester.last_response)
-    if length:
-        print(f"[+] Detected OTP length: {length}, type: {otp_type}")
-    else:
-        print("[-] OTP details undetected")
-   
-    if auto_mode:
-        if not length:
-            otp_type_choice = input("Enter OTP type (1: number only, 2: alphanum): ")
-            otp_type = 'number' if otp_type_choice == '1' else 'alphanum'
-            length = int(input("Enter OTP length: "))
-       
-        otp_result = tester.otp_bruteforce(otp_form, length, otp_type)
-        if otp_result == "BLOCKED":
-            print(f"[!] OTP brute detected for {account['username']}")
-            return False, False # success, brute_success
-        elif otp_result:
-            print(f"[+] OTP brute successful: {otp_result}")
-            tester.save_cookies(account['username'])
-            return True, True
-        else:
-            print(f"[-] OTP brute failed")
-            return False, False
-    else:
-        otp_code = input("Enter OTP code: ").strip()
-        success = tester.try_otp(otp_form, otp_code)
-        if success:
-            print(f"[+] OTP successful for {account['username']}")
-            tester.save_cookies(account['username'])
-            return True, None # No brute
-        else:
-            print(f"[-] OTP failed")
-            return False, None
-        
+
 async def main():
     host = input("Enter target host (e.g., http://example.com): ").strip()
     output_dir = "data"
@@ -114,8 +54,13 @@ async def main():
     dir_output = f"data/dir_{safe_host}.txt"
     successful_logins_path = f"data/successful_logins_{safe_host}.txt"
     wordlist_path = "data/wordlist.txt"
+    
+    # Check if wordlist exists
+    if not os.path.exists(wordlist_path):
+        print(f"[-] Wordlist not found at {wordlist_path}")
+        return
         
-    # Create bruteforcer instance AFTER wordlist_path is defined
+    # Create bruteforcer instance
     bruteforcer = DirectoryBruteforcer(host, wordlist_path, dir_output)
     
     # Check if result file already exists
@@ -168,7 +113,14 @@ async def main():
     print(f" URL: {login_page}")
     print(f" Action: {login_form.get('action', 'N/A')}")
     print(f" Method: {login_form.get('method', 'N/A')}")
-    print(f" Username field: {login_form.get('username_field', 'N/A')} ({login_form['inputs'][0]['type'] if login_form['inputs'] else 'N/A'})") # Show type for choice
+    
+    # Check if inputs exist before accessing them
+    if login_form.get('inputs'):
+        username_field_type = login_form['inputs'][0]['type'] if login_form['inputs'] else 'N/A'
+    else:
+        username_field_type = 'N/A'
+        
+    print(f" Username field: {login_form.get('username_field', 'N/A')} ({username_field_type})")
     print(f" Password field: {login_form.get('password_field', 'N/A')}")
     print(f" Form type: {'Complicated' if login_form.get('is_complicated') else 'Simple'}")
     print(" Inputs:")
@@ -177,9 +129,9 @@ async def main():
    
     # Determine username type
     username_type = 'username'
-    if 'email' in login_form.get('username_field', '').lower() or login_form['inputs'][0]['type'] == 'email':
+    if 'email' in login_form.get('username_field', '').lower() or (login_form.get('inputs') and login_form['inputs'][0]['type'] == 'email'):
         username_type = 'email'
-    elif login_form['inputs'][0]['type'] == 'number':
+    elif login_form.get('inputs') and login_form['inputs'][0]['type'] == 'number':
         username_type = 'phone'
     print(f"[+] Detected username type: {username_type}")
    
@@ -195,42 +147,46 @@ async def main():
     if os.path.exists(successful_logins_path):
         print(f"[+] Existing successful logins found, testing brute...")
         with open(successful_logins_path, 'r') as f:
-            lines = [line.strip().split(':') for line in f if line.strip()]
-            for username, password, _ in lines:
-                print(f"[*] Brute testing existing: {username}:{password}")
-                success, otp_detected = tester.try_login(login_form, username, password)
-                if tester.brute_force_detected:
-                    brute_success = False
-                    break
-                if success:
-                    if otp_detected:
-                        otp_success, otp_brute = await handle_otp(tester, crawler, {'username': username, 'password': password}, auto_mode=True)
-                        if otp_success:
-                            successful_logins.append({'username': username, 'password': password, 'otp_required': False})
-                        else:
-                            successful_logins.append({'username': username, 'password': password, 'otp_required': True})
-                        if otp_brute is not None:
-                            otp_brute_success = otp_brute
-                    else:
-                        successful_logins.append({'username': username, 'password': password, 'otp_required': False})
-                        tester.save_cookies(username)
+            for line in f:
+                if line.strip():
+                    parts = line.strip().split(':')
+                    if len(parts) >= 2:
+                        username, password = parts[0], parts[1]
+                        print(f"[*] Brute testing existing: {username}:{password}")
+                        success, otp_detected = tester.try_login(login_form, username, password)
+                        if tester.brute_force_detected:
+                            brute_success = False
+                            break
+                        if success:
+                            if otp_detected:
+                                # Use the handle_otp method from AuthTester
+                                otp_success, otp_brute = await tester.handle_otp(crawler, {'username': username, 'password': password}, auto_mode=False)
+                                if otp_success:
+                                    successful_logins.append({'username': username, 'password': password, 'otp_required': False})
+                                else:
+                                    successful_logins.append({'username': username, 'password': password, 'otp_required': True})
+                                if otp_brute is not None:
+                                    otp_brute_success = otp_brute
+                            else:
+                                successful_logins.append({'username': username, 'password': password, 'otp_required': False})
+                                tester.save_cookies(username)
    
     # Login mode choice
     choice = input("[?] Login mode: 1. Manual 2. Auto (brute): ")
     auto_mode = choice == '2'
     if not auto_mode:
         manual_used = True
-   
+
     if auto_mode:
         usernames_path = "data/usernames.txt"
         passwords_path = "data/passwords.txt"
         if not os.path.exists(usernames_path) or not os.path.exists(passwords_path):
             print("[-] Wordlists for brute not found")
             return
-       
+    
         usernames = [line.strip() for line in open(usernames_path, 'r')]
         passwords = [line.strip() for line in open(passwords_path, 'r')]
-       
+    
         for username in usernames:
             if username in tester.successful_usernames:
                 continue
@@ -243,11 +199,9 @@ async def main():
                 if success:
                     brute_success = True
                     if otp_detected:
-                        print("[?] OTP mode: 1. Manual 2. Auto: ")
-                        otp_choice = input()
-                        otp_auto = otp_choice == '2'
-                        otp_success, otp_brute = await handle_otp(tester, crawler, {'username': username, 'password': password}, auto_mode=otp_auto)
-                        otp_brute_success = otp_brute if otp_auto else None
+                        # Tidak ask di sini, pass auto_mode=None agar ask di handle_otp setelah scan form
+                        otp_success, otp_brute = await tester.handle_otp(crawler, {'username': username, 'password': password}, auto_mode=None)
+                        otp_brute_success = otp_brute if otp_brute is not None else None  # otp_brute True jika auto sukses
                         if otp_success:
                             successful_logins.append({'username': username, 'password': password, 'otp_required': False})
                         else:
@@ -264,11 +218,9 @@ async def main():
         success, otp_detected = tester.try_login(login_form, username, password)
         if success:
             if otp_detected:
-                print("[?] OTP mode: 1. Manual 2. Auto: ")
-                otp_choice = input()
-                otp_auto = otp_choice == '2'
-                otp_success, otp_brute = await handle_otp(tester, crawler, {'username': username, 'password': password}, auto_mode=otp_auto)
-                otp_brute_success = otp_brute if otp_auto else None
+                # Tidak ask di sini, pass auto_mode=None agar ask di handle_otp setelah scan form
+                otp_success, otp_brute = await tester.handle_otp(crawler, {'username': username, 'password': password}, auto_mode=None)
+                otp_brute_success = otp_brute if otp_brute is not None else None
                 if otp_success:
                     successful_logins.append({'username': username, 'password': password, 'otp_required': False})
                     tester.save_cookies(username)
@@ -277,12 +229,11 @@ async def main():
             else:
                 successful_logins.append({'username': username, 'password': password, 'otp_required': False})
                 tester.save_cookies(username)
-   
+    
     # Save successful logins if new
     if successful_logins and not os.path.exists(successful_logins_path):
         with open(successful_logins_path, 'w') as f:
             for acc in successful_logins:
-                status = "OTP_REQUIRED" if acc['otp_required'] else "FULL_ACCESS"
                 f.write(f"{acc['username']}:{acc['password']}\n")
    
     # Get directories for report
@@ -290,9 +241,10 @@ async def main():
     if os.path.exists(dir_output):
         with open(dir_output, 'r') as f:
             directories = [line.strip() for line in f if line.strip()]
-   
+    await crawler.close()  
     generate_report(safe_host, directories, successful_logins, brute_success, otp_brute_success, manual_used)
    
     await crawler.close()
+
 if __name__ == "__main__":
     asyncio.run(main())
