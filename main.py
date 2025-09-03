@@ -160,8 +160,10 @@ async def main():
                             break
                         if success:
                             if otp_detected:
-                                # Use the handle_otp method from AuthTester
-                                otp_success, otp_brute = await tester.handle_otp(crawler, {'username': username, 'password': password}, auto_mode=False)
+                                print("[?] OTP mode for existing login: 1. Manual 2. Auto (brute): ")
+                                otp_choice = input()
+                                otp_auto_mode = None if otp_choice == '' else (True if otp_choice == '2' else False)
+                                otp_success, otp_brute = await tester.handle_otp(crawler, {'username': username, 'password': password}, auto_mode=otp_auto_mode)
                                 if otp_success:
                                     successful_logins.append({'username': username, 'password': password, 'otp_required': False})
                                 else:
@@ -233,7 +235,7 @@ async def main():
     
     # Save successful logins if new
     if successful_logins and not os.path.exists(successful_logins_path):
-        with open(successful_logins_path, 'w') as f:
+        with open(successful_logins_path, 'a') as f:
             for acc in successful_logins:
                 f.write(f"{acc['username']}:{acc['password']}\n")
    
