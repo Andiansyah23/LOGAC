@@ -15,7 +15,7 @@ class DirectoryBruteforcer:
     
     async def filter_wordlist_login_only(self):
         """Filter wordlist to only include words in authentication sections"""
-        login_keywords = ['login', 'auth', 'signin', 'signup', 'log-in', 'log_in', 'authentication', 'user', 'users']
+        login_keywords = ['login', 'auth', 'signin', 'log-in', 'log_in', 'authentication', 'user', 'users']
         words = []
         in_login_section = False
         

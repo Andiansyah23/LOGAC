@@ -5,8 +5,6 @@ import time
 import json
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
-import certifi  
-
 
 class AuthTester:
     def __init__(self, base_url):
@@ -57,8 +55,41 @@ class AuthTester:
             'User-Agent': random.choice(self.user_agents)
         }
 
-        # Step 2: Simulasi GET /sessions/two-factor/app untuk crawl form OTP segar (seperti browser)
-        otp_form_url = 'https://github.com/sessions/two-factor/app'  # Dari contoh Anda; sesuaikan jika beda host
+        # NEW: Dinamis deteksi otp_form_url dari redirect atau crawling
+        otp_keywords = ['otp', 'verification', 'two-factor', '2fa', 'twofactor', 'authenticator', 'verification code', 'mfa', 'one-time', 'security code', 'pin', 'app_otp', 'totp']  # Dari kode Anda, perluas untuk akurasi
+        otp_form_url = None
+
+        # Prioritas 1: Check jika last_response.url (setelah login) sudah OTP page (dari redirect)
+        if self.last_response:
+            last_url = self.last_response.url.lower()
+            if any(kw in last_url for kw in otp_keywords):
+                otp_form_url = self.last_response.url
+                print(f"[+] Detected OTP form URL from redirect: {otp_form_url}")
+
+        # Prioritas 2: Jika tidak, extract links dari last_response dan cari URL dengan otp_keywords
+        if not otp_form_url and self.last_response:
+            # Fetch HTML dari last_response jika perlu (asumsi self.last_response adalah requests.Response)
+            soup = BeautifulSoup(self.last_response.text, 'html.parser')
+            links = []
+            for a in soup.find_all('a', href=True):
+                href = urljoin(self.base_url, a['href'])
+                if any(kw in href.lower() for kw in otp_keywords):
+                    links.append(href)
+            
+            if links:
+                otp_form_url = links[0]  # Ambil yang pertama match
+                print(f"[+] Detected OTP form URL from links in last response: {otp_form_url}")
+            else:
+                print("[-] No OTP URL found in links from last response")
+
+        # Fallback: Tanya user jika tidak ditemukan (sekali saja di awal)
+        if not otp_form_url:
+            otp_form_url = input("[?] Enter OTP form URL manually (e.g., from redirect or known path): ").strip()
+            if not otp_form_url:
+                print("[-] No OTP form URL provided. Aborting.")
+                return False, False
+
+        # Step 2: Crawl form OTP dari URL yang dideteksi (sekali saja)
         print(f"[*] Crawling fresh OTP form at: {otp_form_url}")
         otp_form = await crawler.crawl_otp_form(otp_form_url, extra_headers=extra_headers, cookies=cookies)
 
@@ -66,7 +97,7 @@ class AuthTester:
             print(f"[-] OTP form not found for {account['username']}")
             return False, False
 
-        # Print crawled headers and cookies
+        # Print crawled headers and cookies (sekali saja)
         print(f"[+] Crawled Headers from OTP form: {otp_form.get('headers', 'N/A')}")
         print(f"[+] Crawled Cookies from OTP form: {otp_form.get('cookies', 'N/A')}")
 
@@ -82,7 +113,7 @@ class AuthTester:
             print("[-] OTP form rejected by user.")
             return False, False
 
-        # Detect length and type
+        # Detect length and type (sekali saja)
         length, otp_type = self.detect_otp_details(self.last_response)
         if length:
             print(f"[+] Detected OTP length: {length}, type: {otp_type}")
@@ -91,7 +122,7 @@ class AuthTester:
             length = 6
             otp_type = 'number'
 
-        # Ask mode if not provided
+        # Ask mode if not provided (sekali saja)
         otp_auto = auto_mode
         if otp_auto is None:
             print("[?] OTP mode: 1. Manual 2. Auto (brute): ")
@@ -115,7 +146,7 @@ class AuthTester:
                 print(f"[-] OTP brute failed")
                 return False, otp_brute_success
         else:
-            # Manual mode: Loop untuk validasi input OTP
+            # Manual mode: Loop untuk input OTP dan submit (retry di sini, reuse otp_form_url dan otp_form)
             while True:
                 otp_code = input("Enter OTP code: ").strip()
                 valid = True
@@ -136,25 +167,19 @@ class AuthTester:
                         pass
                     else:
                         continue  # Ulang input
-                # Jika valid atau force, keluar loop untuk submit
-                break
-
-            # Submit OTP menggunakan form segar (di luar loop validasi)
-            success = self.try_otp(otp_form, otp_code)
-            if success:
-                print(f"[+] OTP successful for {account['username']}")
-                self.save_cookies(account['username'])
-                return True, otp_brute_success
-            else:
-                print(f"[-] OTP incorrect or failed")
-                # Optional: Ask if retry with new OTP
-                retry = input("[?] Retry with new OTP? (y/N): ").strip().lower()
-                if retry == 'y':
-                    # Rekursif atau loop luar untuk retry (atau panggil ulang manual logic)
-                    return await self.handle_otp(crawler, account, auto_mode=False)  # Rekursif untuk retry manual
+                # Jika valid atau force, lanjut submit
+                success = self.try_otp(otp_form, otp_code, base_url=self.base_url, otp_form_url=otp_form_url)  # Reuse otp_form dan url
+                if success:
+                    print(f"[+] OTP successful for {account['username']}")
+                    self.save_cookies(account['username'])
+                    return True, otp_brute_success
                 else:
-                    return False, otp_brute_success
-
+                    print(f"[-] OTP incorrect or failed")
+                    # Ask if retry (loop kembali ke input OTP, tanpa re-crawl)
+                    retry = input("[?] Retry with new OTP? (y/N): ").strip().lower()
+                    if retry != 'y':
+                        return False, otp_brute_success
+                    # Jika 'y', loop ulang ke input OTP (reuse form/url)
 
 
     def detect_otp_details(self, response):
@@ -326,6 +351,11 @@ class AuthTester:
                 # Baseline size
                 self.baseline_size = len(response.text)
                
+                # NEW: Detect if AJAX likely (e.g., multipart without file, or JS indicators)
+                is_ajax_likely = 'multipart' in enctype.lower() or any('ajax' in inp.get('name', '').lower() for inp in inputs)
+                if is_ajax_likely:
+                    print("[+] Detected potential AJAX form submission")
+               
                 return {
                     'action': action,
                     'method': method,
@@ -336,152 +366,267 @@ class AuthTester:
                     'headers': dict(response.request.headers),
                     'baseline_size': self.baseline_size,
                     'baseline_otp_detected': self.baseline_otp_detected,
-                    'enctype': enctype
+                    'enctype': enctype,
+                    'is_ajax_likely': is_ajax_likely,  # NEW: Flag for AJAX mode
                 }
         return None
            
     def try_login(self, login_data, username, password):
-            # Set baseline from login_data if available
-            self.baseline_otp_detected = login_data.get('baseline_otp_detected', False)
-            self.baseline_size = login_data.get('baseline_size', None)
-            # Skip if username already successful
-            if username in self.successful_usernames:
-                return False, False
-               
-            # Store the login page URL for refreshing
-            if not self.login_page_url:
-                self.login_page_url = login_data.get('action', '').replace('/session', '/login')
-               
-            # Store original login form for comparison
-            if not self.original_login_form:
-                self.original_login_form = login_data
-               
-            # Refresh the form if it's complicated (this sets baseline)
-            if login_data.get('is_complicated', False):
-                fresh_login_data = self.refresh_login_form()
-                if fresh_login_data:
-                    login_data = fresh_login_data
-               
-            url = login_data['action']
-            method = login_data['method'].lower()
-           
-            # Prepare headers dinamis
-            headers = self.default_headers.copy()
-            headers.update(login_data.get('headers', {})) # Ambil dari login_data atau fresh
-            headers['User-Agent'] = random.choice(self.user_agents)
-            headers['Referer'] = self.login_page_url
-            headers['Origin'] = urlparse(self.base_url).scheme + '://' + urlparse(self.base_url).netloc
-           
-            # Prepare data with all form fields, including hidden ones
-            data = {inp['name']: inp['value'] for inp in login_data['inputs'] if inp.get('name')}
-           
-            # Get the identified username and password fields
-            username_field = login_data.get('username_field')
-            password_field = login_data.get('password_field')
-           
-            if not username_field or not password_field:
-                print("[-] Could not identify username or password field")
-                return False, False
-           
-            # Update with current credentials
-            data[username_field] = username
-            data[password_field] = password
-           
-            # Print what's being posted
-            print(f"[*] POST data: {data}")
-            print(f"[*] Headers: {headers}")
-           
-            # Initialize response_sizes with baseline if first attempt
-            if not self.response_sizes and self.baseline_size is not None:
-                self.response_sizes['baseline'] = self.baseline_size
-           
-            enctype = login_data.get('enctype', 'application/x-www-form-urlencoded').lower()
-            if 'Content-Type' in headers:
-                del headers['Content-Type']
-           
-            if method == 'post':
-                if 'multipart' in enctype:
-                    post_data = {k: (None, str(v)) for k, v in data.items()}
-                    response = self.session.post(url, files=post_data, headers=headers, allow_redirects=True)
-                elif 'json' in enctype:
-                    headers['Content-Type'] = 'application/json'
-                    response = self.session.post(url, json=data, headers=headers, allow_redirects=True)
+        # Set baseline from login_data if available
+        self.baseline_otp_detected = login_data.get('baseline_otp_detected', False)
+        self.baseline_size = login_data.get('baseline_size', None)
+        pre_cookies = dict(self.session.cookies)  
+        # Skip if username already successful
+        if username in self.successful_usernames:
+            return False, False
+        
+        # Store the login page URL for refreshing
+        if not self.login_page_url:
+            self.login_page_url = login_data.get('action', '').replace('/session', '/login')
+        
+        # Store original login form for comparison
+        if not self.original_login_form:
+            self.original_login_form = login_data
+        
+        # Refresh the form if it's complicated (this sets baseline)
+        if login_data.get('is_complicated', False):
+            fresh_login_data = self.refresh_login_form()
+            if fresh_login_data:
+                login_data = fresh_login_data
+        
+        url = login_data['action']
+        method = login_data['method'].lower()
+        
+        # Prepare headers dinamis
+        headers = self.default_headers.copy()
+        headers.update(login_data.get('headers', {})) # Ambil dari login_data atau fresh
+        headers['User-Agent'] = random.choice(self.user_agents)
+        headers['Referer'] = self.login_page_url
+        headers['Origin'] = urlparse(self.base_url).scheme + '://' + urlparse(self.base_url).netloc
+        
+        # Prepare data with all form fields, including hidden ones
+        data = {inp['name']: inp['value'] for inp in login_data['inputs'] if inp.get('name')}
+        
+        # Get the identified username and password fields
+        username_field = login_data.get('username_field')
+        password_field = login_data.get('password_field')
+        
+        if not username_field or not password_field:
+            print("[-] Could not identify username or password field")
+            return False, False
+        
+        # Update with current credentials
+        data[username_field] = username
+        data[password_field] = password
+        
+        # NEW: Check for AJAX mode dynamically (match contoh portswigger)
+        is_ajax = login_data.get('is_ajax_likely', False) or login_data.get('is_complicated', False) or 'multipart' in login_data.get('enctype', '').lower() or any('RequestVerificationToken' in inp.get('name', '') for inp in login_data['inputs'])
+        if is_ajax:
+            print("[*] Detected AJAX/multipart form submission ")
+            # Adjust headers for AJAX (match contoh: X-Requested-With, Sec-Fetch-Mode, dll.)
+            headers.update({
+                'X-Requested-With': 'XMLHttpRequest',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Dest': 'empty',
+                'Accept': '*/*',
+            })
+            # Tambah field "ajaxRequest" jika tidak ada (match contoh)
+            if 'ajaxRequest' not in data:
+                data['ajaxRequest'] = 'true'
+            # Gunakan multipart/form-data (match contoh)
+            enctype = 'multipart/form-data'
+            # Adjust URL jika ada returnUrl (match contoh: /users?returnUrl=...)
+            if 'returnUrl' not in url and 'returnurl' in self.login_page_url.lower():
+                return_url = urlparse(self.login_page_url).query.replace('returnurl=', 'returnUrl=')
+                url = f"{url}?{return_url}" if '?' not in url else f"{url}&{return_url}"
+        
+        # Hitung Content-Length dinamik (match contoh)
+        headers['Content-Length'] = str(len(str(data)))
+        
+        # Print informasi lengkap request (header full, cookies full, post data/params)
+        print(f"[*] Full Request Info:")
+        print(f"  - URL: {url}")
+        print(f"  - Method: {method.upper()}")
+        print(f"  - Headers: {headers}")
+        print(f"  - Cookies: {dict(self.session.cookies)}")  # Full cookies dari session
+        # NEW: Print data in multipart format jika AJAX/multipart
+        if is_ajax and 'multipart' in enctype:
+            boundary = '----WebKitFormBoundary' + ''.join(random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') for _ in range(16))  # Random boundary match contoh
+            post_data_str = f"Content-Type: multipart/form-data; boundary={boundary}\n"
+            for key, value in data.items():
+                post_data_str += f"--{boundary}\nContent-Disposition: form-data; name=\"{key}\"\n\n{value}\n"
+            post_data_str += f"--{boundary}--"
+            print(f"  - Data/Params (Multipart Format): \n{post_data_str}")
+        else:
+            print(f"  - Data/Params: {data}")        
+        # Initialize response_sizes with baseline if first attempt
+        if not self.response_sizes and self.baseline_size is not None:
+            self.response_sizes['baseline'] = self.baseline_size
+        
+        enctype = login_data.get('enctype', 'application/x-www-form-urlencoded').lower()
+        if 'Content-Type' in headers:
+            del headers['Content-Type']
+        
+        # Handle request with retry for connection error
+        max_retries = 5
+        for retry in range(max_retries):
+            try:
+                time.sleep(random.uniform(0.1, 0.5))  # Minimal random delay seperti browser
+                
+                original_url = url  # Simpan URL before untuk logging
+                
+                if method == 'post':
+                    if 'multipart' in enctype:
+                        post_data = {k: (None, str(v)) for k, v in data.items()}  # Multipart match contoh
+                        response = self.session.post(url, files=post_data, headers=headers, allow_redirects=True)
+                    elif 'json' in enctype:
+                        headers['Content-Type'] = 'application/json'
+                        response = self.session.post(url, json=data, headers=headers, allow_redirects=True)
+                    else:
+                        headers['Content-Type'] = 'application/x-www-form-urlencoded'
+                        response = self.session.post(url, data=data, headers=headers, allow_redirects=True)
                 else:
-                    headers['Content-Type'] = 'application/x-www-form-urlencoded'
-                    response = self.session.post(url, data=data, headers=headers, allow_redirects=True)
-            else:
-                response = self.session.get(url, params=data, headers=headers, allow_redirects=True)
-           
-            # Tambahkan delay random untuk menghindari rate limit
-            time.sleep(random.uniform(0.5, 1.5))
-           
-            # Track redirects
-            if response.history:
-                print(f"[*] Redirect chain:")
-                for i, redirect in enumerate(response.history):
-                    print(f" {i}. {redirect.url} ({redirect.status_code})")
-                print(f" Final URL: {response.url}")
-           
-            # Detect brute force
-            if self.detect_bruteforce(response):
-                self.brute_force_detected = True
-                return False, False
-           
-            # Evaluate if login was successful
-            login_success, score, otp_detected = self.evaluate_login_success(response)
-           
-            print(f"[*] Login score: {score}")
-           
-            if login_success:
-                self.successful_usernames.add(username)
-                # Update response sizes with this response
-                self.response_sizes[username] = len(response.text)
-                return True, otp_detected
-            return False, otp_detected
+                    response = self.session.get(url, params=data, headers=headers, allow_redirects=True)
+                
+                # Break jika sukses
+                break
+            
+            except (requests.exceptions.ConnectionError, requests.exceptions.RequestException) as e:
+                print(f"[-] Connection error on attempt {retry + 1}/{max_retries}: {str(e)}")
+                if retry == max_retries - 1:
+                    print("[-] Max retries reached. Aborting login attempt.")
+                    return False, False
+        
+        # NEW: Handle JSON response with potential client-side redirect
+        content_type = response.headers.get('Content-Type', '').lower()
+        if 'application/json' in content_type:
+            try:
+                json_data = json.loads(response.text)
+                print(f"[*] JSON Response Data: {json_data}")  # Logging JSON
+                if 'redirect' in json_data:
+                    redirect_url = json_data['redirect']
+                    print(f"[*] Following client-side redirect from JSON to: {redirect_url}")
+                    # Follow redirect with GET
+                    response = self.session.get(redirect_url, headers=headers, allow_redirects=True)
+                    print(f"[*] Followed to: Status={response.status_code}, URL={response.url}")
+            except json.JSONDecodeError:
+                print("[-] Failed to parse JSON response")
+        
+        # Print full response info (tetap sama)
+        print(f"[*] Full Response Info:")
+        print(f"  - Status Code: {response.status_code}")
+        print(f"  - URL Before: {original_url}")
+        print(f"  - URL Now: {response.url}")
+        print(f"  - Redirect History: {response.history}")
+        print(f"  - Headers: {dict(response.headers)}")
+        print(f"  - Cookies: {dict(response.cookies)}")
+        
+        # Detect brute force (tetap)
+        if self.detect_bruteforce(response):
+            self.brute_force_detected = True
+            return False, False
+        
+        # Evaluate success on the final response, pass pre_cookies untuk check
+        login_success, score, otp_detected = self.evaluate_login_success(response, pre_cookies=pre_cookies)
+        
+        print(f"[*] Login score: {score}")
+        print(f"[*] Login Successful: {login_success}")
+        
+        if login_success:
+            self.successful_usernames.add(username)
+            self.response_sizes[username] = len(response.text)
+            return True, otp_detected
+        return False, otp_detected
     
-    def evaluate_login_success(self, response):
+    def evaluate_login_success(self, response, pre_cookies=None):
         """Evaluate login success using a scoring system with context-aware checks"""
         score = 0
+        content_type = response.headers.get('Content-Type', '').lower()
+        final_url = response.url.lower()
         soup = BeautifulSoup(response.text, 'html.parser')
-        content_lower = response.text.lower()
-        final_url = response.url
-    
-        # A. Success indicators (+1 each): Look for links or buttons with these texts
-        success_indicators = ['logout', 'dashboard', 'welcome', 'my account', 'sign out', 'profile', 'logged in', 'user info', 'account', 'settings', 'balance', 'credit card', 'your information', 'session started']
-        for indicator in success_indicators:
-            # Check in <a> tags (navbar links)
-            if soup.find('a', string=lambda text: text and indicator in text.lower()):
-                score += 1
-                print(f"[+] Found success indicator: '{indicator}' in <a> tag")
-            # Or in visible div/span with class indicating success
-            elif soup.find(lambda tag: tag.name in ['div', 'span', 'p', 'h1', 'h2', 'h3'] and indicator in tag.text.lower() and any(cls in tag.get('class', []) for cls in ['success', 'info', 'welcome'])):
-                score += 1
-                print(f"[+] Found success indicator: '{indicator}' in success message")
-    
-        # B. Failure indicators (-2 each): Look in <p>, <div> with error class, or visible alerts
-        failure_indicators = ['invalid', 'incorrect', 'error', 'failed', 'wrong', 'bad', 'not found', 'try again', 'authentication failed', 'access denied', 'sorry', 'login failed']
-        for indicator in failure_indicators:
-            # Check in <p> tags
-            if soup.find('p', string=lambda text: text and indicator in text.lower()):
-                score -= 2
-                print(f"[-] Found failure indicator: '{indicator}' in <p> tag")
-            # Or in div with class like 'error', 'alert', etc., and not hidden
-            elif soup.find('div', attrs={'class': lambda c: c and any(cls in c for cls in ['error', 'alert', 'flash-error', 'danger'])}):
-                if indicator in soup.text.lower() and 'hidden' not in soup.find('div').attrs:
+        
+        # NEW: Handle JSON response (AJAX mode)
+        if 'application/json' in content_type:
+            try:
+                json_data = json.loads(response.text)
+                if json_data.get('success', False) or 'redirect' in json_data or json_data.get('loggedIn', False):
+                    score += 3
+                    print("[+] JSON response indicates success (success/redirect/loggedIn found)")
+                elif 'error' in json_data or 'failed' in json_data.get('message', '').lower():
+                    score -= 3
+                    print("[-] JSON response indicates failure")
+                # OTP detection in JSON
+                otp_detected = 'otp' in str(json_data).lower() or 'two-factor' in str(json_data).lower()
+            except json.JSONDecodeError:
+                print("[-] Failed to parse JSON response")
+                otp_detected = False
+        else:
+            content_lower = response.text.lower()
+            # OTP detection in HTML (tetap)
+            otp_keywords = ['otp', 'verification', 'two-factor', '2fa', 'twofactor', 'authenticator', 'verification code', 'mfa', 'one-time', 'security code', 'pin']
+            otp_detected = any(keyword in content_lower for keyword in otp_keywords) or any(keyword in final_url for keyword in otp_keywords)
+        
+        # NEW: Check for NEW auth cookies (bandingkan dengan pre_cookies)
+        if pre_cookies is not None:
+            post_cookies = dict(response.cookies)
+            auth_cookie_keywords = ['authenticated', 'logged_in', 'sessionid', 'verificationid']  # Perketat dengan keyword dari contoh
+            new_auth_cookies = [key for key in post_cookies if key not in pre_cookies and any(kw in key.lower() for kw in auth_cookie_keywords)]
+            if new_auth_cookies:
+                score += 2
+                print(f"[+] New auth cookies detected: {new_auth_cookies}")
+            else:
+                print("[-] No new auth cookies detected")            
+            # 2. Success indicators (+1 each): Look for links or buttons with these texts
+            success_indicators = ['youraccount','logout', 'dashboard', 'welcome', 'my account','my-account', 'sign out', 'profile', 'logged in', 'user info', 'account', 'settings', 'balance', 'credit card', 'your information', 'session started','subscription','personal']
+            for indicator in success_indicators:
+                # Check in <a> tags (navbar links)
+                if soup.find('a', string=lambda text: text and indicator in text.lower()):
+                    score += 1
+                    print(f"[+] Found success indicator: '{indicator}' in <a> tag")
+                # Check in <button> tags (for sign out buttons)
+                elif soup.find('button', string=lambda text: text and indicator in text.lower()):
+                    score += 1
+                # Or in visible div/span with class indicating success
+                elif soup.find(lambda tag: tag.name in ['li', 'nav', 'header', 'div', 'span', 'p', 'h1', 'h2', 'h3'] and indicator in tag.text.lower() and any(cls in tag.get('class', []) for cls in ['success', 'info', 'welcome'])):
+                    score += 1
+                    print(f"[+] Found success indicator: '{indicator}' in success message")
+                
+                # OPTIMIZED: Check other tags with proper variable handling
+                found_tag = None
+                for tag_name in ['li', 'nav', 'header', 'div', 'span', 'p', 'h1', 'h2', 'h3']:
+                    found_tag = soup.find(tag_name, string=lambda text: text and indicator in text.lower())
+                    if found_tag:
+                        score += 1
+                        print(f"[+] Found success indicator: '{indicator}' in {tag_name} tag (relaxed check)")
+                        break
+            # B. Failure indicators (-2 each): Improved to check within specific elements
+            failure_indicators = ['invalid', 'incorrect', 'error', 'failed', 'wrong', 'bad', 'not found', 'try again', 'authentication failed', 'access denied', 'sorry', 'login failed']
+            error_classes = ['error', 'alert', 'flash-error', 'danger']
+            for indicator in failure_indicators:
+                # Check in <p> tags
+                p_tag = soup.find('p', string=lambda text: text and indicator in text.lower())
+                if p_tag:
                     score -= 2
-                    print(f"[-] Found failure indicator: '{indicator}' in visible error div")
-            # Add check in <span> or <h2> etc.
-            found_tag = soup.find(lambda tag: tag.name in ['span', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'] and indicator in tag.text.lower())
-            if found_tag:
+                    print(f"[-] Found failure indicator: '{indicator}' in <p> tag")
+                # Check in error divs specifically within the div's text
+                error_divs = soup.find_all('div', attrs={'class': lambda c: c and any(cls in c for cls in error_classes)})
+                for div in error_divs:
+                    if indicator in div.text.lower() and 'hidden' not in div.attrs:
+                        score -= 2
+                        print(f"[-] Found failure indicator: '{indicator}' in visible error div")
+                        break  # Avoid multiple penalties for same indicator
+                # Check in <span> or <h#> etc.
+                found_tag = soup.find(lambda tag: tag.name in ['span', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'] and indicator in tag.text.lower())
+                if found_tag:
+                    score -= 2
+                    print(f"[-] Found failure indicator: '{indicator}' in {found_tag.name} tag")
+
+            # Special handling for 'login': Check in <button> or <h1>-<h6>
+            if soup.find('button', string=lambda text: text and 'login' in text.lower()) or \
+            any(soup.find(f'h{i}', string=lambda text: text and 'login' in text.lower()) for i in range(1,7)):
                 score -= 2
-                print(f"[-] Found failure indicator: '{indicator}' in {found_tag.name} tag")
-    
-        # Special handling for 'login': Check in <button> or <h1>-<h6>
-        if soup.find('button', string=lambda text: text and 'login' in text.lower()) or \
-        any(soup.find(f'h{i}', string=lambda text: text and 'login' in text.lower()) for i in range(1,7)):
-            score -= 2
-            print(f"[-] Found failure indicator: 'login' in <button> or <h#> tag")
-    
+                print(f"[-] Found failure indicator: 'login' in <button> or <h#> tag")
+
         # C. Check if still on login page
         if not self.is_still_login_page(response):
             score += 1
@@ -489,63 +634,49 @@ class AuthTester:
         else:
             score -= 1
             print("[-] Still on login page")
-    
+        
         # D. Different page (redirect)
-        if (final_url != self.login_page_url and
-            final_url != self.original_login_form.get('action', '')):
+        if (final_url != self.login_page_url and final_url != self.original_login_form.get('action', '')):
             score += 1
             print("[+] Redirected to different page")
-            if any(word in final_url.lower() for word in ['dashboard', 'home', 'profile', 'user', 'account']):
+            success_redirect_keywords = ['dashboard', 'home', 'profile', 'user', 'account', 'youraccount', 'licenses']  # Tambah 'youraccount' dari contoh
+            if any(keyword in final_url for keyword in success_redirect_keywords):
                 score += 1
-                print("[+] Redirected to a likely success page")
+                print("[+] Redirected to a likely success page (bonus)")
         else:
             score -= 1
             print("[-] Not redirected to different page")
-    
-        # E. Response size comparison (20% diff)
+        
+        # E. Response size comparison (adjust for JSON: kurangi bobot jika JSON kecil)
         current_size = len(response.text)
         if self.response_sizes:
             avg_prev_size = sum(self.response_sizes.values()) / len(self.response_sizes)
             diff_percent = abs(current_size - avg_prev_size) / avg_prev_size * 100 if avg_prev_size > 0 else 0
             if diff_percent > 20:
-                score += 2
-                print(f"[+] Significant response size difference: {current_size} vs avg {avg_prev_size:.2f} ({diff_percent:.2f}%)")
-                # Add if larger, perhaps success
-                if current_size > avg_prev_size:
-                    score += 1
-                    print("[+] Response larger than average, likely success")
+                if 'application/json' in content_type and current_size < avg_prev_size:
+                    score += 1  # Kurangi bobot untuk JSON kecil (mungkin gagal, bukan sukses)
+                    print(f"[+] Minor response size difference (JSON adjustment): {current_size} vs avg {avg_prev_size:.2f} ({diff_percent:.2f}%)")
+                else:
+                    score += 2
+                    print(f"[+] Significant response size difference: {current_size} vs avg {avg_prev_size:.2f} ({diff_percent:.2f}%)")
+                    if current_size > avg_prev_size:
+                        score += 1
+                        print("[+] Response larger than average, likely success")
             else:
                 score -= 1
-                print(f"[-] Minor response size difference: {current_size} vs avg {avg_prev_size:.2f} ({diff_percent:.2f}%)")
+                print(f"[-] Minor response size difference")
         else:
             print("[-] No baseline size for comparison")
-    
-        # F. OTP detection (+2 if detected and not in baseline): Check in form labels or inputs
-        otp_keywords = ['otp', 'verification', 'two-factor', '2fa', 'twofactor', 'authenticator', 'verification code', 'mfa', 'one-time', 'security code', 'pin']
-        otp_detected = False
-        for keyword in otp_keywords:
-            # Look in form-related elements
-            if (soup.find('label', string=lambda text: text and keyword in text.lower()) or
-                soup.find('input', attrs={'placeholder': lambda p: p and keyword in p.lower()}) or
-                soup.find('form', {'action': lambda x: x and 'two-factor' in x.lower()})):
-                otp_detected = True
-                print("[+] OTP detected in HTML elements")  # Tambahan logging untuk debug
-                break
         
-        # PERBAIKAN: Gabungkan deteksi di URL ke otp_detected (sebelum kondisi if)
-        otp_in_url = any(keyword in final_url.lower() for keyword in otp_keywords)
-        otp_detected = otp_detected or otp_in_url  # Ini perubahan kunci: sekarang URL trigger otp_detected = True
-        if otp_in_url:
-            print("[+] OTP detected in URL")  # Tambahan logging untuk debug
-        
+        # F. OTP detection (tetap, dengan adjust dari JSON)
         if otp_detected and not self.baseline_otp_detected:
             score += 2
             print("[+] OTP keywords detected (not in baseline)")
-    
+        
         # Determine success (>=3)
         login_success = score >= 3
-    
-        return login_success, score, otp_detected  # Sekarang otp_detected akan True jika di URL
+        
+        return login_success, score, otp_detected
 
     def evaluate_otp_success(self, response, original_otp_url):
         """Evaluate OTP success using scoring system with context-aware checks"""
@@ -554,46 +685,57 @@ class AuthTester:
         content_lower = response.text.lower()
         final_url = response.url.lower()  # Lowercase for case-insensitive check
         
+        print("[DEBUG] Starting OTP evaluation score: 0")
+        print(f"[DEBUG] Final URL: {response.url}")
+        print(f"[DEBUG] Status Code: {response.status_code}")
+        
         # PERBAIKAN: Check status code for failure (e.g., 401 Unauthorized)
         if response.status_code in [401, 403]:
             score -= 3
-            print("[-] Failure: Unauthorized status code detected")
+            print("[DEBUG] [-] Failure: Unauthorized status code detected | Score now: {score}")
         
         # 1. Detect response redirect
         if response.history:
-            print("[+] Redirect detected")
-            score += 2  # Positive for potential success
+            print("[DEBUG] [+] Redirect detected")
+            score += 2
+            print(f"[DEBUG] Score now: {score}")
             # PERBAIKAN: Check if redirected back to OTP or login page (failure)
             if any('login' in r.url.lower() or 'otp' in r.url.lower() or 'verify' in r.url.lower() for r in response.history) or \
             'login' in final_url or 'otp' in final_url or 'verify' in final_url:
-                score -= 4  # Heavy penalty for failure redirect
-                print("[-] Failure: Redirected back to login/OTP page")
+                score -= 4
+                print("[DEBUG] [-] Failure: Redirected back to login/OTP page | Score now: {score}")
             # Check if redirected to a success-like page (hanya jika bukan failure URL)
-            success_redirect_keywords = ['dashboard', 'home', 'profile', 'user', 'account', '/']
+            success_redirect_keywords = ['dashboard', 'home', 'profile', 'user', 'account', '/', 'settings']  # Added 'settings' for GitHub-like cases
             if any(keyword in final_url for keyword in success_redirect_keywords) and \
             not any(keyword in final_url for keyword in ['login', 'otp', 'verify']):
-                print("[+] Redirected to a likely success page")
+                print("[DEBUG] [+] Redirected to a likely success page")
                 score += 3
+                print(f"[DEBUG] Score now: {score}")
             if final_url == original_otp_url.lower():
-                print("[-] Redirected back to original OTP URL - likely failure")
+                print("[DEBUG] [-] Redirected back to original OTP URL - likely failure")
                 score -= 4
+                print(f"[DEBUG] Score now: {score}")
         else:
-            print("[-] No redirect detected")
+            print("[DEBUG] [-] No redirect detected")
             if final_url == original_otp_url.lower():
                 score -= 2  # Still on OTP page without redirect - possible failure
+                print(f"[DEBUG] Score now: {score}")
         
-        # 2. Success indicators (+1 each): Look for links or buttons with these texts
-        success_indicators = ['logout', 'dashboard', 'welcome', 'my account', 'sign out', 'profile', 'logged in', 'user info', 'account', 'settings', 'balance', 'credit card', 'your information', 'session started']
+        # 2. Success indicators (+1 each)
+        success_indicators = ['youraccount','logout', 'dashboard', 'welcome', 'my account','my-account', 'sign out', 'profile', 'logged in', 'user info', 'account', 'settings', 'balance', 'credit card', 'your information', 'session started','subscription','personal']
         for indicator in success_indicators:
-            # Check in <a> tags (navbar links)
-            if soup.find('a', string=lambda text: text and indicator in text.lower()):
+            # Expanded tag search: Added <li>, <ul> for navbars
+            found = False
+            for tag_name in ['a', 'button', 'li', 'div', 'span', 'p', 'h1', 'h2', 'h3']:
+                tag = soup.find(tag_name, string=lambda text: text and indicator in text.lower())
+                if tag:
+                    score += 1
+                    print(f"[DEBUG] [+] Found success indicator: '{indicator}' in <{tag_name}> tag | Score now: {score}")
+                    found = True
+                    break  # Avoid multiple +1 for same indicator
+            if not found and any(cls in ['success', 'info', 'welcome'] for cls in soup.find_all(attrs={'class': lambda c: c})):
                 score += 1
-                print(f"[+] Found success indicator: '{indicator}' in <a> tag")
-            # Or in visible div/span with class indicating success
-            elif soup.find(lambda tag: tag.name in ['div', 'span', 'p', 'h1', 'h2', 'h3'] and indicator in tag.text.lower() and any(cls in tag.get('class', []) for cls in ['success', 'info', 'welcome'])):
-                score += 1
-                print(f"[+] Found success indicator: '{indicator}' in success message")
-        
+                print(f"[DEBUG] [+] Found success class for '{indicator}' | Score now: {score}")        
         # 3. Strict failure detection: Require at least two specific keywords in context (e.g., 'two-factor' and 'failed')
         failure_keywords_sets = [
             ['two-factor', 'failed'],
@@ -673,32 +815,44 @@ class AuthTester:
         else:
             score += 1
         
-        # PERBAIKAN: Print score breakdown untuk debug
-        print(f"[*] OTP evaluation score: {score} (threshold >=5)")
+        print(f"[*] OTP evaluation score: {score} (threshold >=4)")
         
-        # Adjust threshold for stricter failure detection
-        return score >= 5, score  # Tingkatkan threshold ke >=5
-    
+        return score >= 4, score        
     def is_still_login_page(self, response):
-        """Check if the response still contains a login form"""
+        """Check if the response still contains a login form or failure indicators"""
+        content_type = response.headers.get('Content-Type', '').lower()
+        
+        # Jika response JSON (AJAX mode), analisis JSON untuk failure
+        if 'application/json' in content_type:
+            try:
+                json_data = json.loads(response.text)
+                # Jika 'success' False or ada 'error'/'failed'/'invalid', anggap still failure (login gagal)
+                if not json_data.get('success', True) or 'error' in json_data or 'failed' in json_data.get('message', '').lower() or 'invalid' in json_data.get('message', '').lower():
+                    return True  # Still failure state
+                return False  # Sukses (no failure indicators)
+            except json.JSONDecodeError:
+                print("[-] Failed to parse JSON in is_still_login_page")
+                return True  # Default to True if parse gagal (aman)
+        
+        # Untuk HTML, check seperti sebelumnya
         soup = BeautifulSoup(response.text, 'html.parser')
-       
+        
         # Check for password fields
         if soup.find('input', {'type': 'password'}):
             return True
-       
+        
         # Check if the form structure matches the original login form
         forms = soup.find_all('form')
         for form in forms:
             username_field = self.original_login_form.get('username_field')
             password_field = self.original_login_form.get('password_field')
-           
+            
             if username_field and form.find('input', {'name': username_field}):
                 if password_field and form.find('input', {'type': 'password', 'name': password_field}):
                     return True
-       
+        
         return False
-    
+        
     def check_otp_required(self):
         if not self.last_response:
             return False
@@ -748,7 +902,8 @@ class AuthTester:
         self.last_response = None
 
 
-    def try_otp(self, otp_form, otp_code):
+
+    def try_otp(self, otp_form, otp_code, base_url=None, otp_form_url=None):
         url = otp_form['action']
         method = otp_form['method'].lower()
 
@@ -832,29 +987,31 @@ class AuthTester:
         else:
             data[otp_fields[0]] = otp_code  # Isi hanya field OTP utama
 
-        # Prepare headers: Match persis dari contoh Anda
+        # NEW: Headers dinamis berdasarkan url dan base_url (match contoh Anda, bukan GitHub)
+        parsed_url = urlparse(url)
+        parsed_base = urlparse(base_url or self.base_url) if base_url else urlparse(self.base_url)
         headers = {
-            'Host': 'github.com',
-            'Content-Length': str(len(str(data))),  # Dinamis seperti contoh
+            'Host': parsed_url.netloc,  # Dinamis dari URL (e.g., '127.0.0.1:5002')
+            'Content-Length': str(len(str(data))),  # Dinamis
             'Cache-Control': 'max-age=0',
-            'Sec-Ch-Ua': '"(Not(A:Brand";v="99", "Google Chrome";v="132", "Chromium";v="132"',
-            'Sec-Ch-Ua-Mobile': '?0',
-            'Sec-Ch-Ua-Platform': '"macOS"',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Origin': 'https://github.com',
-            'Content-Type': 'application/x-www-form-urlencoded',
+            'Origin': f"{parsed_base.scheme}://{parsed_base.netloc}",  # Dinamis dari base_url (e.g., 'http://127.0.0.1:5002')
+            'Content-Type': 'application/x-www-form-urlencoded',  # Default, adjust jika multipart
             'Upgrade-Insecure-Requests': '1',
-            'User-Agent': random.choice(self.user_agents),  # Rotasi, tapi match contoh
+            'User-Agent': random.choice(self.user_agents),
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
             'Sec-Fetch-Site': 'same-origin',
             'Sec-Fetch-Mode': 'navigate',
             'Sec-Fetch-User': '?1',
             'Sec-Fetch-Dest': 'document',
-            'Referer': 'https://github.com/sessions/two-factor/app',  # Match contoh
+            'Referer': otp_form_url or self.last_response.url or self.login_page_url,  # Gunakan otp_form_url jika dipass, fallback ke last_response atau login_page
             'Accept-Encoding': 'gzip, deflate, br',
-            'Sec-Ch-Ua-Full-Version-List': '"(Not(A:Brand";v="99.0.0.0", "Google Chrome";v="132", "Chromium";v="132"',
-            'Priority': 'u=0, i'
+            'Connection': 'keep-alive'
         }
+        # Jika detected AJAX/multipart dari otp_form, adjust seperti sebelumnya
+        enctype = otp_form.get('enctype', 'application/x-www-form-urlencoded').lower()
+        if 'multipart' in enctype:
+            headers['Content-Type'] = 'multipart/form-data'  # Adjust jika multipart
 
         # Konversi cookies dari crawl ke dict sederhana {name: value}
         request_cookies = {}
@@ -879,7 +1036,15 @@ class AuthTester:
                 time.sleep(random.uniform(0.1, 0.5))  # Minimal random delay seperti browser (no jeda fixed)
 
                 if method == 'post':
-                    response = self.session.post(url, data=data, headers=headers, cookies=request_cookies, allow_redirects=True)
+                    if 'multipart' in enctype:
+                        post_data = {k: (None, str(v)) for k, v in data.items()}
+                        response = self.session.post(url, files=post_data, headers=headers, cookies=request_cookies, allow_redirects=True)
+                    elif 'json' in enctype:
+                        headers['Content-Type'] = 'application/json'
+                        response = self.session.post(url, json=data, headers=headers, cookies=request_cookies, allow_redirects=True)
+                    else:
+                        headers['Content-Type'] = 'application/x-www-form-urlencoded'
+                        response = self.session.post(url, data=data, headers=headers, cookies=request_cookies, allow_redirects=True)
                 else:
                     response = self.session.get(url, params=data, headers=headers, cookies=request_cookies, allow_redirects=True)
 
@@ -905,7 +1070,7 @@ class AuthTester:
         print(f"      Headers (key): Content-Type={response.headers.get('Content-Type')}, Server={response.headers.get('Server')}")
         print(f"      Cookies: {dict(response.cookies)}")
 
-        # Check for possible expired OTP (jika redirect ke login-like page)
+        # Check for possible expired OTP (tetap)
         if 'login' in str(response.url).lower():
             print("[!] Possible OTP expired (redirected back to login)")
 

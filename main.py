@@ -50,7 +50,8 @@ async def main():
     if not host.startswith(('http://', 'https://')):
         host = 'http://' + host
    
-    safe_host = host.replace('http://', '').replace('https://', '').replace(':', '_').replace('/', '_').rstrip('/')
+    safe_host = host.replace('http://', '').replace('https://', '').rstrip('/')
+    safe_host = safe_host.replace(':', '_').replace('/', '_')
     dir_output = f"data/dir_{safe_host}.txt"
     successful_logins_path = f"data/successful_logins_{safe_host}.txt"
     wordlist_path = "data/wordlist.txt"

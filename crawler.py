@@ -11,7 +11,17 @@ class WebCrawler:
         self.base_url = base_url
         self.session = aiohttp.ClientSession()
         self.visited = set()
-      
+        
+        # Wordlist potensi login page (dari daftar Anda)
+        self.login_keywords = [
+            'login', 'log-in', 'signin', 'sign-in', 'auth', 'authentication', 'account', 'user', 'users',
+            'admin', 'administrator', 'secure', 'oauth', 'oauth2', 'sso', 'openid', 'saml', 'authz',
+            'authorize', 'authorization', 'callback', 'token', 'tokens', 'refresh-token', 'access-token',
+            'session', 'sessions', 'cookie', 'cookies', 'logout', 'signout', 'log-out', 'sign-out',
+            'verify', 'verification', 'confirm', 'confirmation', 'activation', 'activate', 'my-profile',
+            'myaccount', 'my-account', 'profile', 'profiles'
+        ]
+
     async def fetch(self, url, extra_headers=None, cookies=None):
         try:
             headers = {
@@ -31,18 +41,174 @@ class WebCrawler:
                     response_cookies = dict(response.cookies)
                     print(f"[*] Response Headers for {url}: {response_headers}")
                     print(f"[*] Cookies for {url}: {response_cookies}")
-                  
+                    
                     html = await response.text()
                     return {
                         'html': html,
                         'headers': response_headers,
                         'cookies': response_cookies,
-                        'url': str(response.url)
+                        'url': str(response.url)  # Final URL setelah redirect
                     }
         except Exception as e:
             print(f"Error fetching {url}: {e}")
         return None
+
+    async def extract_links(self, url, extra_headers=None, cookies=None):
+        result = await self.fetch(url, extra_headers, cookies)
+        if not result:
+            return []
           
+        html = result['html']
+        soup = BeautifulSoup(html, 'html.parser')
+        links = set()
+          
+        for element in soup.find_all('a', href=True):
+            href = element['href']
+          
+            if href.startswith(('#', 'javascript:', 'mailto:')):
+                continue
+              
+            full_url = urljoin(url, href)
+          
+            if urlparse(full_url).netloc != urlparse(self.base_url).netloc:
+                continue
+              
+            excluded_extensions = [
+                '.js', '.css', '.png', '.jpg', '.jpeg', '.gif', '.pdf',
+                '.ico', '.svg', '.woff', '.ttf', '.xml', '.json', '.txt',
+                '.zip', '.rar', '.tar', '.gz', '.7z', '.exe', '.dmg', '.iso'
+            ]
+            if any(full_url.lower().endswith(ext) for ext in excluded_extensions):
+                continue
+              
+            parsed_url = urlparse(full_url)
+            clean_url = urlunparse((
+                parsed_url.scheme,
+                parsed_url.netloc,
+                parsed_url.path,
+                '', '', ''
+            ))
+            clean_url = clean_url.rstrip('/')
+          
+            if '?' in full_url:
+                continue
+              
+            if len(clean_url.split('/')) > 8:
+                continue
+              
+            skip_patterns = [
+                r'\/api\/', r'\/ajax\/', r'\/rest\/', r'\/graphql', r'\/ws\/', r'\/wss\/',
+                r'\/feed\/', r'\/rss\/', r'\/atom\/', r'\/sitemap', r'\/\.well-known\/',
+            ]
+            if any(re.search(pattern, clean_url, re.IGNORECASE) for pattern in skip_patterns):
+                continue
+              
+            if clean_url.strip() and clean_url not in links:
+                links.add(clean_url)
+                  
+        return list(links)
+
+    async def find_login_page(self, dir_file, extra_headers=None, cookies=None):
+        # Baca existing directories dari dir_file
+        known_urls = set()
+        if os.path.exists(dir_file):
+            with open(dir_file, 'r') as f:
+                known_urls = {line.strip() for line in f if line.strip()}
+        
+        # Prioritas 1: Check URL dari wordlist potensi login (gabung dengan base_url)
+        potential_login_urls = set()
+        for keyword in self.login_keywords:
+            potential_url = urljoin(self.base_url, keyword)
+            potential_login_urls.add(potential_url)
+        
+        # Tambahkan known_urls ke potential (hindari double)
+        potential_login_urls.update(known_urls)
+        
+        # Set visited untuk hindari double check
+        self.visited = set()
+        
+        # Queue untuk crawling (prioritas potential login URLs dulu untuk optimasi)
+        queue = collections.deque(list(potential_login_urls) + [self.base_url])
+        
+        batch_size = 100  # Batch 100 per iterasi
+        while queue:
+            batch = []
+            for _ in range(min(batch_size, len(queue))):
+                current_url = queue.popleft()
+                if current_url in self.visited:
+                    continue  # Hindari double check
+                self.visited.add(current_url)
+                batch.append(current_url)
+            
+            # Crawl batch dan analisis
+            tasks = [self.fetch(url, extra_headers, cookies) for url in batch]
+            results = await asyncio.gather(*tasks)
+            
+            for current_url, result in zip(batch, results):
+                if not result:
+                    continue
+                
+                fetched_url = result['url']  # Final URL setelah redirect
+                
+                # Analisis redirect: Jika redirect terjadi dan final URL punya indicator login
+                if fetched_url != current_url:
+                    print(f"[*] Redirect detected: {current_url} -> {fetched_url}")
+                    # Check jika fetched_url punya indicator login
+                    path = urlparse(fetched_url).path.lower()
+                    if any(kw in path for kw in self.login_keywords):
+                        # Analisis form di redirected URL
+                        login_form = await self.crawl_login_page(fetched_url, extra_headers, cookies)
+                        if login_form:
+                            # Tambahkan ke dir_output jika belum ada
+                            if fetched_url not in known_urls:
+                                with open(dir_file, 'a') as f:
+                                    f.write(fetched_url + '\n')
+                                known_urls.add(fetched_url)
+                                print(f"[+] Added redirected URL to dir_output: {fetched_url}")
+                            return fetched_url, login_form  # Ditemukan, return
+        
+                # Analisis form di original fetched URL
+                if any(kw in urlparse(fetched_url).path.lower() for kw in self.login_keywords):
+                    print(f"[*] Checking potential login URL: {fetched_url}")
+                    login_form = await self.crawl_login_page(fetched_url, extra_headers, cookies)
+                    if login_form:
+                        # Tambahkan ke dir_output jika belum ada
+                        if fetched_url not in known_urls:
+                            with open(dir_file, 'a') as f:
+                                f.write(fetched_url + '\n')
+                            known_urls.add(fetched_url)
+                        return fetched_url, login_form
+            
+            # Jika tidak ditemukan di batch, extract links baru untuk batch berikutnya
+            tasks = [self.extract_links(url, extra_headers, cookies) for url in batch]
+            results = await asyncio.gather(*tasks)
+            
+            for urls in results:
+                for link in urls:
+                    # Optimasi: Hanya tambah link jika mengandung keyword login (minimalkan scan)
+                    if link not in self.visited and link not in queue and any(kw in link.lower() for kw in self.login_keywords):
+                        queue.append(link)
+            
+            print(f"[*] Processed batch of {len(batch)}, total visited: {len(self.visited)}, queue remaining: {len(queue)}")
+            
+            # Batasi total crawl (misal max 500 untuk hindari terlalu banyak)
+            if len(self.visited) > 500:
+                print("[!] Max crawl limit reached. No login form found.")
+                break
+        
+        # Jika masih tidak ditemukan, tanya manual
+        print("[!] Login page not found after analysis")
+        manual_url = input("Enter login page URL manually: ").strip()
+        login_form = await self.crawl_login_page(manual_url, extra_headers, cookies)
+        if login_form:
+            # Tambahkan ke dir_output jika belum ada
+            if manual_url not in known_urls:
+                with open(dir_file, 'a') as f:
+                    f.write(manual_url + '\n')
+            return manual_url, login_form
+        return None, None
+
+    
     async def crawl_login_page(self, url, extra_headers=None, cookies=None):
         result = await self.fetch(url, extra_headers, cookies)
         if not result:
@@ -168,132 +334,7 @@ class WebCrawler:
                     'inputs': inputs,
                     'enctype': enctype
                 }
-        return None
-    
-    async def extract_links(self, url, extra_headers=None, cookies=None):
-        result = await self.fetch(url, extra_headers, cookies)
-        if not result:
-            return []
-          
-        html = result['html']
-        soup = BeautifulSoup(html, 'html.parser')
-        links = set()
-          
-        for element in soup.find_all('a', href=True):
-            href = element['href']
-          
-            if href.startswith(('#', 'javascript:', 'mailto:')):
-                continue
-              
-            full_url = urljoin(url, href)
-          
-            if urlparse(full_url).netloc != urlparse(self.base_url).netloc:
-                continue
-              
-            excluded_extensions = [
-                '.js', '.css', '.png', '.jpg', '.jpeg', '.gif', '.pdf',
-                '.ico', '.svg', '.woff', '.ttf', '.xml', '.json', '.txt',
-                '.zip', '.rar', '.tar', '.gz', '.7z', '.exe', '.dmg', '.iso'
-            ]
-            if any(full_url.lower().endswith(ext) for ext in excluded_extensions):
-                continue
-              
-            parsed_url = urlparse(full_url)
-            clean_url = urlunparse((
-                parsed_url.scheme,
-                parsed_url.netloc,
-                parsed_url.path,
-                '', '', ''
-            ))
-            clean_url = clean_url.rstrip('/')
-          
-            if '?' in full_url:
-                continue
-              
-            if len(clean_url.split('/')) > 8:
-                continue
-              
-            skip_patterns = [
-                r'\/api\/', r'\/ajax\/', r'\/rest\/', r'\/graphql', r'\/ws\/', r'\/wss\/',
-                r'\/feed\/', r'\/rss\/', r'\/atom\/', r'\/sitemap', r'\/\.well-known\/',
-            ]
-            if any(re.search(pattern, clean_url, re.IGNORECASE) for pattern in skip_patterns):
-                continue
-              
-            if clean_url.strip() and clean_url not in links:
-                links.add(clean_url)
-                  
-        return list(links)
-  
-    async def find_login_page(self, dir_file, extra_headers=None, cookies=None):
-        login_keywords = ['login', 'auth', 'signin', 'log-in', 'log_in', 'authentication', 'masuk', 'akun', 'sign-in', 'session']
-          
-        # Read existing directories
-        known_urls = set()
-        if os.path.exists(dir_file):
-            with open(dir_file, 'r') as f:
-                known_urls = {line.strip() for line in f if line.strip()}
-          
-        # Check known URLs for login
-        for url in known_urls:
-            if any(keyword in urlparse(url).path.lower() for keyword in login_keywords):
-                print(f"[*] Checking potential login URL: {url}")
-                login_form = await self.crawl_login_page(url, extra_headers, cookies)
-                if login_form:
-                    return url, login_form
-          
-        # If not found, start crawling in batches of 20
-        queue = collections.deque([self.base_url])
-        visited = set([self.base_url])
-        new_urls = set()
-        batch_size = 20
-          
-        while queue:
-            batch = []
-            for _ in range(min(batch_size, len(queue))):
-                current_url = queue.popleft()
-                batch.append(current_url)
-              
-            tasks = [self.extract_links(url, extra_headers, cookies) for url in batch]
-            results = await asyncio.gather(*tasks)
-              
-            for urls in results:
-                for link in urls:
-                    if link not in visited and link not in queue:
-                        visited.add(link)
-                        queue.append(link)
-                        new_urls.add(link)
-              
-            # Check new batch for login
-            for url in list(new_urls)[:batch_size]: # Check only the new ones in batch
-                if any(keyword in urlparse(url).path.lower() for keyword in login_keywords):
-                    print(f"[*] Checking crawled login URL: {url}")
-                    login_form = await self.crawl_login_page(url, extra_headers, cookies)
-                    if login_form:
-                        # Save new urls before return
-                        with open(dir_file, 'a') as f:
-                            for u in new_urls:
-                                if u not in known_urls:
-                                    f.write(u + '\n')
-                        return url, login_form
-              
-            # Save progress
-            with open(dir_file, 'a') as f:
-                for u in new_urls:
-                    if u not in known_urls:
-                        f.write(u + '\n')
-            new_urls.clear()
-              
-            print(f"[*] Crawled batch, total visited: {len(visited)}")
-          
-        # If still not found, ask manual
-        print("[!] Login page not found after crawling")
-        manual_url = input("Enter login page URL manually: ").strip()
-        login_form = await self.crawl_login_page(manual_url, extra_headers, cookies)
-        if login_form:
-            return manual_url, login_form
-        return None, None
-    
+        return None    
     async def crawl_otp_form(self, url, extra_headers=None, cookies=None):
         result = await self.fetch(url, extra_headers, cookies)
         if not result:
