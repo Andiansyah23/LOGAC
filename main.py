@@ -144,36 +144,46 @@ async def main():
     otp_brute_success = None
     manual_used = False
    
-    # Check if successful_logins exists
     if os.path.exists(successful_logins_path):
-        print(f"[+] Existing successful logins found, testing brute...")
-        with open(successful_logins_path, 'r') as f:
-            for line in f:
-                if line.strip():
-                    parts = line.strip().split(':')
-                    if len(parts) >= 2:
-                        username, password = parts[0], parts[1]
-                        print(f"[*] Brute testing existing: {username}:{password}")
-                        success, otp_detected = tester.try_login(login_form, username, password)
-                        if tester.brute_force_detected:
-                            brute_success = False
-                            break
-                        if success:
-                            if otp_detected:
-                                print("[?] OTP mode for existing login: 1. Manual 2. Auto (brute): ")
-                                otp_choice = input()
-                                otp_auto_mode = None if otp_choice == '' else (True if otp_choice == '2' else False)
-                                otp_success, otp_brute = await tester.handle_otp(crawler, {'username': username, 'password': password}, auto_mode=otp_auto_mode)
-                                if otp_success:
-                                    successful_logins.append({'username': username, 'password': password, 'otp_required': False})
+        print(f"[+] Existing successful logins found. Re-test them? (y/N): ")
+        re_test = input().strip().lower() == 'y'
+        if re_test:
+            print("[+] Testing brute on existing logins...")
+            with open(successful_logins_path, 'r') as f:
+                for line in f:
+                    if line.strip():
+                        parts = line.strip().split(':')
+                        if len(parts) >= 2:
+                            username, password = parts[0], parts[1]
+                            print(f"[*] Brute testing existing: {username}:{password}")
+                            success, otp_detected = tester.try_login(login_form, username, password)
+                            if tester.brute_force_detected:
+                                brute_success = False
+                                break
+                            if success:
+                                if otp_detected:
+                                    # Prompt mode OTP untuk konsistensi
+                                    print("[?] OTP mode for existing login: 1. Manual 2. Auto (brute): ")
+                                    otp_choice = input().strip()
+                                    otp_auto_mode = True if otp_choice == '2' else False
+                                    otp_success, otp_brute = await tester.handle_otp(crawler, {'username': username, 'password': password}, auto_mode=otp_auto_mode)
+                                    if otp_success:
+                                        successful_logins.append({'username': username, 'password': password, 'otp_required': False})
+                                    else:
+                                        successful_logins.append({'username': username, 'password': password, 'otp_required': True})
+                                    if otp_brute is not None:
+                                        otp_brute_success = otp_brute
                                 else:
-                                    successful_logins.append({'username': username, 'password': password, 'otp_required': True})
-                                if otp_brute is not None:
-                                    otp_brute_success = otp_brute
-                            else:
-                                successful_logins.append({'username': username, 'password': password, 'otp_required': False})
-                                tester.save_cookies(username)
-   
+                                    successful_logins.append({'username': username, 'password': password, 'otp_required': False})
+                                    tester.save_cookies(username)
+        else:
+            print("[+] Skipping re-test, using existing logins without verification.")
+            with open(successful_logins_path, 'r') as f:
+                for line in f:
+                    if line.strip():
+                        parts = line.strip().split(':')
+                        if len(parts) >= 2:
+                            successful_logins.append({'username': parts[0], 'password': parts[1], 'otp_required': False})  # Asumsi no OTP untuk existing   
     # Login mode choice
     choice = input("[?] Login mode: 1. Manual 2. Auto (brute): ")
     auto_mode = choice == '2'

